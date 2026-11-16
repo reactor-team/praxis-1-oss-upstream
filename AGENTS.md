@@ -21,6 +21,7 @@ results reproducible. `README.md` is the user guide.
 | `praxis/single_arm.py`, `praxis/bimanual.py`, `praxis/robot_io.py` | the robot input and output of each rig: canvases, pose frames, normalization, command decoding |
 | `praxis/so101.py` | the SO-100 / SO-101 rig (`"embodiment": "so101"`): LeRobot joint units, the fit-rule canvas of 1 or 2 views, the streaming session, the hooks of its server sessions |
 | `praxis/checkpoint.py` | the checkpoint format: `config.json` validation, strict load, `save_checkpoint`, `SHA256SUMS` |
+| `praxis/compile_cache.py` | the on-disk compile cache (`PRAXIS_CACHE_DIR`): the Inductor, Triton and `flash-attn-4` cache variables under one versioned directory, set before `import torch` |
 | `praxis/vae.py`, `praxis/text_encoder.py` | the video autoencoder and the text encoder |
 | `praxis/kernels/` | Triton kernels (forward and backward) that keep the bits of the checkpoint |
 | `praxis/quantization/`, `praxis/kernels/nvfp4.py` | the optional routed NVFP4 inference on SM120 GPUs (`model.routed_precision: nvfp4`): packing, the cached load and the activation kernels |

@@ -40,21 +40,55 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import platform
 import sys
 import time
 from contextlib import nullcontext
 from pathlib import Path
 
-import torch
+
+def process_age() -> float | None:
+    """Return the seconds since the start of this process (Linux), or None."""
+    try:
+        stat = Path("/proc/self/stat").read_text()
+        # Field 22, the start time in clock ticks after boot. The command name
+        # (field 2) is in parentheses and can hold spaces.
+        ticks = int(stat.rsplit(")", 1)[1].split()[19])
+        boot = time.clock_gettime(time.CLOCK_BOOTTIME)
+        return boot - ticks / os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, IndexError, AttributeError):
+        return None
+
+
+# The process age at this line, before torch is imported. Without /proc, the
+# times of summary.json["startup"] count from this line.
+_AGE0, _T0 = process_age(), time.monotonic()
+
+
+def since_start() -> float:
+    """Return the seconds since the start of the process."""
+    return (_AGE0 or 0.0) + time.monotonic() - _T0
+
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from praxis import single_arm
-from praxis.checkpoint import load_config as checkpoint_config
-from praxis.layers import Attention
-from praxis.pipeline import PraxisPipeline
-from praxis.profiling import (
+from praxis.compile_cache import (  # noqa: E402
+    CACHE_DIR_ENV,
+    cache_env,
+    configure_compile_cache,
+)
+
+# Before torch: the compile caches read their variables at import.
+configure_compile_cache()
+
+import torch  # noqa: E402
+
+from praxis import single_arm  # noqa: E402
+from praxis.checkpoint import load_config as checkpoint_config  # noqa: E402
+from praxis.layers import Attention  # noqa: E402
+from praxis.pipeline import PraxisPipeline  # noqa: E402
+from praxis.profiling import (  # noqa: E402
     STAGES,
     StageTimer,
     instrument,
@@ -62,7 +96,7 @@ from praxis.profiling import (
     summarize_calls,
     synthetic_obs,
 )
-from scripts.run_inference import build_pipeline, load_config
+from scripts.run_inference import build_pipeline, load_config  # noqa: E402
 
 PROMPT = "Put the red block in the bowl."
 
@@ -294,6 +328,8 @@ def run(
                         ),
                         save_outputs / f"session_{s:03d}_call_{k:03d}.pt",
                     )
+                # The process age when the call returned (outside the timer).
+                rec["since_start_s"] = round(since_start(), 3)
                 records.append(dict(rec))
                 print(
                     f"session {s} call {k}: depth {res.depth}, {rec['total']:.0f} ms"
@@ -329,6 +365,32 @@ def summary(records: list[dict]) -> dict:
             **(summarize_calls(staged, ("total_staged", *STAGES)) if staged else {}),
         }
     return out
+
+
+def startup(
+    records: list[dict], load_start: float, load_end: float, depths: int
+) -> dict:
+    """Return the startup times of the process and the compile cache in use.
+
+    The times count from the start of the process (``process_age``), in
+    seconds: ``imports_s`` until the pipeline load starts (torch, praxis),
+    ``load_s`` the pipeline load (weights, text encoder, VAE, CUDA graphs),
+    ``first_call_s`` the first policy call (it compiles the kernels of depth
+    0), ``to_first_call_s`` from the start of the process to the end of the
+    first call, and ``to_all_depths_s`` to the end of the first call of each
+    context depth. With a warm compile cache the first calls load their
+    kernels instead of compiling them.
+    """
+    keys = (CACHE_DIR_ENV, *cache_env("."))
+    return {
+        "imports_s": round(load_start, 3),
+        "load_s": round(load_end - load_start, 3),
+        "first_call_s": round(records[0]["total"] / 1e3, 3),
+        "to_first_call_s": records[0]["since_start_s"],
+        "to_all_depths_s": records[depths - 1]["since_start_s"],
+        "process_age_available": _AGE0 is not None,
+        "compile_cache": {k: os.environ.get(k) for k in keys},
+    }
 
 
 def format_summary(out: dict) -> str:
@@ -399,7 +461,9 @@ def main() -> None:
         # expert copies host tables, which a CUDA graph capture refuses.
         cfg["model"]["action_cuda_graphs"] = False
         cfg["model"]["nvfp4_moe_cuda_graphs"] = False
+    load_start = since_start()
     pipe = build_pipeline(cfg)
+    load_end = since_start()
     if pipe.embodiment != "single_arm":
         raise SystemExit(
             f"The benchmark makes single-arm observations; the checkpoint is for "
@@ -432,6 +496,7 @@ def main() -> None:
         "timing_mode": args.timing,
         "saved_outputs": args.save_outputs,
         "summary_ms": summary(records),
+        "startup": startup(records, load_start, load_end, depths),
     }
     (args.out / "calls.jsonl").write_text(
         "".join(json.dumps(r) + "\n" for r in records)
@@ -439,6 +504,7 @@ def main() -> None:
     (args.out / "summary.json").write_text(json.dumps(out, indent=1))
     print(json.dumps({k: out[k] for k in ("environment", "settings")}, indent=1))
     print(format_summary(out["summary_ms"]))
+    print(json.dumps({"startup": out["startup"]}, indent=1))
 
 
 if __name__ == "__main__":

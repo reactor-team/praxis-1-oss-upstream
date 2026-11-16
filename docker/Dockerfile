@@ -14,6 +14,12 @@
 # history, so give the commit for the handshake with
 # -e PRAXIS_SERVED_COMMIT=$(git rev-parse HEAD).
 #
+# The warmup of the server compiles the attention kernels. To keep the
+# compiled kernels across restarts, mount a volume and set PRAXIS_CACHE_DIR
+# (see "Compile cache" in README.md):
+#   docker run --gpus all -p 8000:8000 -v /path/to/weights:/weights \
+#       -v praxis-cache:/cache -e PRAXIS_CACHE_DIR=/cache praxis-serve
+#
 # The Modal app (praxis/serve/modal_app.py) builds this image too.
 
 # The devel image holds nvcc. pip compiles causal-conv1d with it, because

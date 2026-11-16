@@ -836,6 +836,9 @@ times direct encoder and decoder calls when expert overlap is enabled.
 Stage synchronization can reduce overlap. These timings include profiling overhead.
 Use `--timing total` to measure latency with synchronization only at call
 boundaries. This mode preserves expert overlap and omits per-stage timings.
+`summary.json["startup"]` holds the startup times of the process: the
+imports, the pipeline load, the first call and the time from the start of the
+process to the end of the first call (see "Compile cache").
 `--save-outputs` writes actions, video latents and commands for every call to
 `outputs/` inside the run directory. Use these files for before/after bitwise
 comparisons. Copies and disk writes are outside the call timer, but can
@@ -919,7 +922,8 @@ resolves torch again, so the step above re-pins cuDNN 9.24 after it.
   tokens and the VAE encodes the 24 executed frames.
 - The warm-up calls compile the attention kernels: the first call of the
   process took 35.0 s (32.5 s with guidance off), the first call with
-  context 1.1 s (0.5 s).
+  context 1.1 s (0.5 s). The first calls depend on the compile caches; see
+  "Compile cache".
 - A later call gives 24 command rows, 1.6 s of motion at 15 Hz. With the
   default settings a call takes about a third of that time.
 - The inputs are synthetic. The routed experts of the backbone depend on
@@ -930,6 +934,124 @@ resolves torch again, so the step above re-pins cuDNN 9.24 after it.
   one H100 or with the two guidance passes on two H100s), the client saw a
   median of 1.1 to 1.4 s per call. Measure your own path
   with `praxis.serve.latency`.
+
+## Compile cache
+
+A new process compiles kernels at run time. The flex attention calls go
+through `torch.compile` (Inductor). Inductor generates Triton kernels, and
+with the `flash` backend it calls the CuTe kernels of `flash-attn-4`, which
+compile on their first call too, which makes the first call of a process far
+slower than the later ones ("Measured times"). The server does this work in
+its warmup. A fresh container compiles all of these kernels at each start. On
+a host whose `/tmp` survives, PyTorch and Triton already reuse their kernels
+from their default directories, and only `flash-attn-4` compiles again in each
+process.
+
+Each of these libraries can keep its compiled kernels on disk and load them in
+the next process. Set `PRAXIS_CACHE_DIR` to one directory for all of them.
+`python -m praxis.serve` and `scripts/benchmark_inference.py` then set these
+defaults before they import torch (`praxis/compile_cache.py`). The Modal app
+does not read `PRAXIS_CACHE_DIR`: with `PRAXIS_MODAL_CACHE_VOLUME` set, it
+sets the same defaults under a local cache directory that it copies from and
+to the volume (`praxis/serve/README.md`).
+
+| Variable | Default with `PRAXIS_CACHE_DIR=<dir>` | Library |
+|---|---|---|
+| `TORCHINDUCTOR_CACHE_DIR` | `<dir>/<versions>/inductor` | PyTorch Inductor: generated code, FX graph cache |
+| `TORCHINDUCTOR_FX_GRAPH_CACHE` | `1` | PyTorch Inductor |
+| `TORCHINDUCTOR_AUTOGRAD_CACHE` | `1` | PyTorch AOTAutograd |
+| `TRITON_CACHE_DIR` | `<dir>/<versions>/triton` | Triton: compiled kernels |
+| `FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED` | `1` | `flash-attn-4`: off by default, the kernels stay in memory |
+| `FLASH_ATTENTION_CUTE_DSL_CACHE_DIR` | `<dir>/<versions>/flash_attn_cute` | `flash-attn-4` |
+
+`<versions>` names the installed versions of `torch`, `triton`,
+`flash-attn-4` and `nvidia-cutlass-dsl` (`none` for a package that is not
+installed). A variable that you set yourself keeps its value.
+`flash-attn-4` reads its two variables, and PyTorch the two `1` flags, when
+they are imported; `TORCHINDUCTOR_CACHE_DIR` and `TRITON_CACHE_DIR` are read
+later, at the first compile. The entry points set all of them before
+`import torch`. Without
+`PRAXIS_CACHE_DIR` nothing changes: PyTorch and Triton use their default
+directories (under `/tmp` and `~/.triton`), which a container loses at exit,
+and `flash-attn-4` keeps no disk cache. In your own code, call
+`praxis.compile_cache.configure_compile_cache("<dir>")` before `import torch`.
+
+```bash
+# A local server: the second start loads the kernels of the first.
+PRAXIS_CACHE_DIR=$HOME/.cache/praxis python -m praxis.serve --config configs/serve_droid.yaml
+# The image of docker/Dockerfile, with a named volume for the cache.
+docker run --gpus all -p 8000:8000 -v /path/to/weights:/weights \
+    -v praxis-cache:/cache -e PRAXIS_CACHE_DIR=/cache praxis-serve
+# Modal: a second volume for the cache (praxis/serve/README.md).
+PRAXIS_MODAL_CACHE_VOLUME=praxis-compile-cache modal deploy praxis/serve/modal_app.py
+```
+
+The caches store the compiled code of the same kernels, and a later process
+loads that code; the code of a kernel and the order of its operations do not
+change. A kernel that Inductor autotunes at run time is the exception: Inductor
+also stores the launch setting that the run picked (`<kernel>.best_config`
+under `TORCHINDUCTOR_CACHE_DIR`), and a warm process reuses the choice of the
+process that wrote the cache instead of benchmarking again. A run without the
+cache is not reproducible across processes on such a path either, since each
+cold process benchmarks again; where the benchmark can pick another setting,
+`praxis/layers.py` fixes it by a rule instead (the dynamic flex decoding
+path).
+
+Each library keys its entries on its own inputs: Inductor hashes the graph,
+its config and the PyTorch version; Triton the kernel source and the compiler;
+`flash-attn-4` stores its entries under a fingerprint of its CuTe sources, the
+Python version and the `cutlass` and `tvm_ffi` versions. That fingerprint does
+not hold the PyTorch version, while a `flash` kernel of flex attention holds
+code that PyTorch generates. The `<versions>` directory keeps the entries of
+each set of package versions apart, so an upgrade of `torch`, `triton`,
+`flash-attn-4` or `nvidia-cutlass-dsl` starts in a new, empty directory and
+compiles again. Old `<versions>` directories are not removed; delete them to
+free the space.
+
+The entries of another GPU architecture have other keys. The `flash-attn-4`
+key holds the architecture but not the number of SMs, so two GPU models of one
+architecture can load kernels sized for the grid of the other (slower, not
+wrong). Use one cache directory per GPU model. Delete the directory to start
+cold. `flash-attn-4` writes its `.o` files in place, so a process killed while
+it writes one can leave a truncated file that later starts fail to load: if a
+cached kernel fails to load, delete `<dir>` (or its `flash_attn_cute`
+subdirectories).
+
+`load_state_dict_from_dir` (`praxis/checkpoint.py`) reads the safetensors
+shards of a checkpoint in `LOAD_WORKERS` threads (default 4, environment
+variable `PRAXIS_LOAD_WORKERS`, read at each load; a value that is not an
+integer fails the load, and a value below 1 means 1). The BF16 checkpoint load
+(`load_checkpoint`, `PraxisPolicy.from_pretrained`) and `praxis/rig.py` go
+through it. The NVFP4 load (`praxis/quantization/loading.py`) and the loads
+of the VAE and the text encoder do not use these threads. Each tensor holds
+the bytes of its shard for any number of threads; `PRAXIS_LOAD_WORKERS=1`
+reads the shards one after the other.
+
+To measure a cold and a warm start, run the benchmark twice with the same
+empty cache directory, and once without a cache for the outputs of the
+reference:
+
+```bash
+export CACHE=/tmp/praxis-cache-check; rm -rf $CACHE
+PRAXIS_CACHE_DIR=$CACHE python scripts/benchmark_inference.py --save-outputs --out outputs/bench_cold
+PRAXIS_CACHE_DIR=$CACHE python scripts/benchmark_inference.py --save-outputs --out outputs/bench_warm
+python - <<'PY'
+import json
+for run in ("cold", "warm"):
+    print(run, json.load(open(f"outputs/bench_{run}/summary.json"))["startup"])
+PY
+```
+
+`summary.json["startup"]` gives, in seconds: `imports_s` (the start of the
+process to the start of the pipeline load: torch, praxis), `load_s` (the
+pipeline load), `first_call_s` (the first call alone), `to_first_call_s` (the
+start of the process to the end of the first call) and `to_all_depths_s` (to
+the end of the first call of each context depth: the end of the compile work).
+`process_age_available` is false where the start of the process is unknown
+(no `/proc`); the times then count from the first line of the script.
+`compile_cache` holds `PRAXIS_CACHE_DIR` and the cache variables of the run. The commands and the actions of the
+`--save-outputs` files of both runs must be bit-identical to the files of a
+run without `PRAXIS_CACHE_DIR`.
 
 ## Use the pipeline in code
 

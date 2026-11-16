@@ -50,6 +50,20 @@ The server loads the model and runs a warmup over the context depths 0 to
 `max_context_chunks` of the config (0 to 1). Then it accepts connections.
 Set `PRAXIS_SKIP_WARMUP=1` to skip the warmup.
 
+The warmup compiles the attention kernels. In a fresh container this is most
+of the boot after the weight load; on a host whose `/tmp` survives, PyTorch
+and Triton reuse their kernels and only `flash-attn-4` compiles again. Set
+`PRAXIS_CACHE_DIR` to a directory that outlives the process (a volume of the
+container) to keep all the compiled kernels there. The next start then loads
+them:
+
+```bash
+PRAXIS_CACHE_DIR=/cache python -m praxis.serve --config configs/serve_droid.yaml
+```
+
+The section "Compile cache" of the top README gives the variables, the
+directory layout and how to check the outputs.
+
 The checkpoint uses the `flash` attention backend. It needs the
 `flash-attn-4` package. The section "Get the weights" of the top README
 tells how to use the `triton` backend instead.
@@ -158,6 +172,7 @@ These environment variables of `modal deploy` change the deployment:
 | `PRAXIS_MODAL_GPU` | `H100` | GPU type. |
 | `PRAXIS_MODAL_VOLUME` | `praxis-weights` | Volume with the weights. |
 | `PRAXIS_MODAL_SCALEDOWN_S` | `1800` | Seconds without a session before the container stops. |
+| `PRAXIS_MODAL_CACHE_VOLUME` | unset | Volume for the compiled kernels, for example `praxis-compile-cache` (created if missing). The boot copies it to a local cache directory and sets the cache variables under it (the app does not read `PRAXIS_CACHE_DIR`); after the warmup it copies the new files back and commits the volume. Best effort: an error logs a warning. Unset: each container compiles again. |
 
 The model paths of the config and `PRAXIS_CHECKPOINT` are paths in the
 volume, relative to the root of the volume. `/checkpoints/x` and

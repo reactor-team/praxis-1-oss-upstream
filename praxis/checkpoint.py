@@ -72,8 +72,10 @@ import fnmatch
 import hashlib
 import json
 import math
+import os
 import re
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TypedDict
@@ -114,6 +116,34 @@ CHECKSUM_NAME = "SHA256SUMS"
 MAX_SHARD_BYTES = 5 * 1000**3
 
 _MAX_LISTED = 20
+
+# The number of shards that load_state_dict_from_dir reads at the same time,
+# one thread per shard. 1 reads them one after the other. The BF16 load
+# (load_checkpoint) and praxis/rig.py use it; the NVFP4 load
+# (praxis/quantization/loading.py) and the VAE and text encoder loads do not. The environment
+# variable PRAXIS_LOAD_WORKERS replaces the default; each load reads it. The
+# threads copy the same bytes into the same tensors, so the loaded weights do
+# not depend on it.
+LOAD_WORKERS = 4
+LOAD_WORKERS_ENV = "PRAXIS_LOAD_WORKERS"
+
+
+def load_workers() -> int:
+    """Return ``PRAXIS_LOAD_WORKERS``, or ``LOAD_WORKERS`` when it is unset or empty.
+
+    Raises ``ValueError`` for a value that is not an integer. A value below 1
+    means 1 thread.
+    """
+    value = os.environ.get(LOAD_WORKERS_ENV, "").strip()
+    if not value:
+        return LOAD_WORKERS
+    try:
+        return max(1, int(value))
+    except ValueError:
+        raise ValueError(
+            f"{LOAD_WORKERS_ENV} must be an integer (the number of threads), "
+            f"not {value!r}"
+        ) from None
 
 
 class CheckpointError(RuntimeError):
@@ -892,12 +922,28 @@ def weight_map(path: str | Path) -> dict[str, str]:
     raise CheckpointError(f"{root} has no {INDEX_NAME} and no {SINGLE_NAME}")
 
 
+def _read_shard(
+    path: Path, names: list[str], wanted: list[str], device: str, cut: int
+) -> dict[str, torch.Tensor]:
+    """Read the tensors ``wanted`` of one shard; check that it holds ``names``."""
+    with safe_open(str(path), framework="pt", device=device) as f:
+        stored = set(f.keys())
+        if stored != set(names):
+            raise CheckpointError(
+                f"{path.name} does not hold the tensors that the index lists: "
+                f"{len(stored - set(names))} extra, "
+                f"{len(set(names) - stored)} missing"
+            )
+        return {name[cut:]: f.get_tensor(name) for name in wanted}
+
+
 def load_state_dict_from_dir(
     path: str | Path,
     *,
     prefix: str = "",
     strip_prefix: bool = True,
     device: str | torch.device = "cpu",
+    workers: int | None = None,
 ) -> dict[str, torch.Tensor]:
     """Load the tensors whose names start with ``prefix``.
 
@@ -905,29 +951,42 @@ def load_state_dict_from_dir(
     keeps its stored dtype. With ``strip_prefix``, the returned names do not
     include ``prefix``. The function raises ``CheckpointError`` when a shard
     and the index do not list the same tensors.
+
+    ``workers`` shards are read at the same time, one thread each (default
+    ``load_workers()``: ``PRAXIS_LOAD_WORKERS``, else ``LOAD_WORKERS``). Each
+    tensor holds the bytes of its shard whatever the number of threads, and
+    the returned dict has the same order: the shards in name order, the
+    tensors in index order.
     """
     root = Path(path)
     files: dict[str, list[str]] = {}
     for name, file in weight_map(root).items():
         files.setdefault(file, []).append(name)
-    out: dict[str, torch.Tensor] = {}
+    device = torch.device(device)
+    if device.type == "cuda" and device.index is None:
+        # The current device belongs to the thread: pass it to the workers.
+        device = torch.device("cuda", torch.cuda.current_device())
     cut = len(prefix) if strip_prefix else 0
-    for file, names in sorted(files.items()):
-        wanted = [n for n in names if n.startswith(prefix)]
-        if not wanted:
-            continue
-        with safe_open(str(root / file), framework="pt", device=str(device)) as f:
-            stored = set(f.keys())
-            if stored != set(names):
-                raise CheckpointError(
-                    f"{file} does not hold the tensors that the index lists: "
-                    f"{len(stored - set(names))} extra, "
-                    f"{len(set(names) - stored)} missing"
-                )
-            for name in wanted:
-                out[name[cut:]] = f.get_tensor(name)
-    if not out:
+    jobs = [
+        (root / file, names, [n for n in names if n.startswith(prefix)])
+        for file, names in sorted(files.items())
+    ]
+    jobs = [job for job in jobs if job[2]]
+    if not jobs:
         raise CheckpointError(f"{root} has no tensor with the prefix {prefix!r}")
+    count = max(1, min(load_workers() if workers is None else workers, len(jobs)))
+
+    def read(job: tuple[Path, list[str], list[str]]) -> dict[str, torch.Tensor]:
+        return _read_shard(*job, device=str(device), cut=cut)
+
+    if count == 1:
+        parts = [read(job) for job in jobs]
+    else:
+        with ThreadPoolExecutor(count, thread_name_prefix="praxis-load") as pool:
+            parts = list(pool.map(read, jobs))
+    out: dict[str, torch.Tensor] = {}
+    for part in parts:
+        out.update(part)
     return out
 
 

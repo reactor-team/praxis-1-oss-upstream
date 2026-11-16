@@ -8,6 +8,10 @@ parameter. A flag replaces one value of the config. ``--set key=value``
 replaces any value, for example
 ``--set "model.vae_norm_block_c={160: 64, 320: 64, 640: 128}"``.
 A Positronic client connects to ``ws://<host>:<port>/api/v1/session``.
+
+``PRAXIS_CACHE_DIR=<dir>`` keeps the compiled attention kernels in ``<dir>``,
+so the next start loads them instead of compiling them again
+(:mod:`praxis.compile_cache`).
 """
 
 from __future__ import annotations
@@ -15,7 +19,13 @@ from __future__ import annotations
 import argparse
 import logging
 
-from praxis.serve.server import build_server, load_config, serve
+from praxis.compile_cache import configure_compile_cache
+
+# Before the server imports torch: the compile caches read their variables at
+# import.
+CACHE = configure_compile_cache()
+
+from praxis.serve.server import build_server, load_config, serve  # noqa: E402
 
 # CLI flag -> config key. A flag that is not set keeps the config value.
 FLAGS: dict[str, tuple[str, type]] = {
@@ -49,6 +59,8 @@ def main() -> None:
     args = ap.parse_args()
     # force: an imported package can install a root handler before this line.
     logging.basicConfig(level=logging.INFO, force=True)
+    if CACHE:
+        logging.getLogger(__name__).info("compile cache: %s", CACHE)
     cfg = load_config(args.config, args.set)
     for name, (key, _kind) in FLAGS.items():
         value = getattr(args, name)
