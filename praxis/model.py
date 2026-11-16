@@ -367,11 +367,14 @@ class PraxisPolicy(nn.Module):
           cached keys and values. The outputs keep their exact bits. Ignored
           when ``trace`` is set or routed experts use NVFP4. NVFP4 activation
           scales depend on all routed rows, including the noised tokens.
-        * ``overlap_expert=True`` (guided): each step that runs both guidance
+        * ``overlap_expert=True``: each step that runs both guidance
           branches runs both encoder passes first, then queues the decoder on
           the current stream and the two action-expert passes on a side CUDA
-          stream beside it. Same kernels on the same inputs, so the same bits.
-          Ignored when ``trace`` is set.
+          stream beside it. An unguided step that runs the decoder does the
+          same with its one branch: the encoder pass, then the decoder on the
+          current stream and the action-expert pass on the side stream. Same
+          kernels on the same inputs, so the same bits. Ignored when
+          ``trace`` is set.
         * ``pair_cfg=True`` (with ``overlap_expert``): the two
           encoder passes run block by block in lockstep, and each
           mixture-of-experts layer reads its routed weights once for both
@@ -464,7 +467,6 @@ class PraxisPolicy(nn.Module):
 
         overlap = (
             overlap_expert
-            and guided
             and trace is None
             and dev.type == "cuda"
             and hasattr(backbone, "encoder")
@@ -566,6 +568,41 @@ class PraxisPolicy(nn.Module):
                     a_u,
                 )
 
+        def velocity_overlapped(
+            x_v: Tensor, x_a: Tensor, t_cur: float
+        ) -> tuple[Tensor, Tensor]:
+            """The one branch of an unguided step that decodes: the
+            encoder, then the expert on ``side`` beside the decoder on the
+            current stream. Steps that skip the decoder take ``velocity``."""
+            assert side is not None
+            enc, dec = backbone.encoder, backbone.decoder  # type: ignore[attr-defined]
+            main = torch.cuda.current_stream(dev)
+            with NV.op("sampler", "timestep_prep", mod="flow", block=None, pas="p"):
+                t_trunk = torch.full((1, kk), t_cur, dtype=md, device=dev)
+                noised = x_v.to(md)
+            with NV.ctx(mod="enc", **{"pass": "g", "block": "pre"}):
+                cond, taps = enc.forward_chunk_causal(
+                    text_c,
+                    anchor_m,
+                    clean,
+                    noised,
+                    t_trunk,
+                    ctx=None if ctxs is None else ctxs["cond"],
+                )
+            side.wait_stream(main)
+            # The decoder is queued first, as in velocities_overlapped.
+            with NV.ctx(mod="dec", **{"pass": "g", "block": "pre"}):
+                v = dec.forward_chunk_causal(noised, cond, t_trunk)
+            with torch.cuda.stream(side):
+                a = expert(taps, x_a, t_cur, "g")
+            main.wait_stream(side)
+            # Tensors made on one stream and used on the other.
+            for t in (*taps.taps, taps.embeddings, x_a, pro):
+                t.record_stream(side)
+            a.record_stream(main)
+            with NV.op("sampler", "velocity_cast", mod="flow", block=None, pas="p"):
+                return v.float(), a
+
         def velocity(
             text_in: Tensor,
             x_v: Tensor,
@@ -621,6 +658,8 @@ class PraxisPolicy(nn.Module):
                 v, a, v_u, a_u = velocities_overlapped(
                     xv, xa, t_cur, video, video and decode_uncond
                 )
+            elif overlap and video:
+                v, a = velocity_overlapped(xv, xa, t_cur)
             else:
                 probe("pass.marker", torch.tensor([step, 0]))
                 v, a = velocity(text_c, xv, xa, t_cur, video)

@@ -308,8 +308,8 @@ class Session:
         # PraxisPolicy.sample_window_joint). NVFP4 cannot reuse context rows:
         # its expert activation scales also depend on the current query rows.
         self.ctx_cache = getattr(pipeline.policy, "supports_context_cache", True)
-        # True: guided window_joint runs the action experts on a side stream
-        # beside the decoder (exact bits). Other layouts ignore it.
+        # True: window_joint runs the action experts on a side stream beside
+        # the decoder, guided or not (exact bits). Other layouts ignore it.
         self.overlap_expert = True
         # True (with overlap_expert): the guided and unguided
         # encoder passes run in lockstep and share each expert-weight read
