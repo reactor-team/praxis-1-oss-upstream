@@ -88,10 +88,13 @@ def configure_optimizations(
     The CUDA graphs are set up when the pipeline loads; the opt-out builds it
     without them, and the result reports whether they are installed.
     """
-    from praxis import layers
+    from praxis import layers, vae
 
     layers.FUSED_ROPE = enabled
     layers.CACHE_DEVICE_TABLES = enabled
+    # Off with --no-optimizations; else the module default
+    # (PRAXIS_VAE_ENCODE_GRAPH=0 turns it off for an A/B run).
+    vae.VAE_ENCODE_GRAPH = enabled and vae.VAE_ENCODE_GRAPH
     original = pipe.session
 
     def session(*args, **kwargs):
@@ -108,6 +111,7 @@ def configure_optimizations(
         ctx_cache=enabled,
         overlap_expert=enabled,
         dedup_encodes=enabled,
+        VAE_ENCODE_GRAPH=vae.VAE_ENCODE_GRAPH,
         action_cuda_graphs=hasattr(pipe, "action_cuda_graphs"),
         nvfp4_moe_cuda_graphs=hasattr(pipe, "nvfp4_moe_cuda_graphs"),
     )
@@ -366,7 +370,8 @@ def main() -> None:
         default=True,
         help="enable the default inference optimizations (default: enabled; "
         "--no-optimizations disables the fused rope, the device tables, the context "
-        "cache, the expert overlap, the encode dedup and the CUDA graphs)",
+        "cache, the expert overlap, the encode dedup and the CUDA graphs, "
+        "including the VAE encode graphs)",
     )
     ap.add_argument(
         "--timing",
@@ -429,6 +434,7 @@ def main() -> None:
             if hasattr(pipe, "action_cuda_graphs")
             else None
         ),
+        "vae_encode_graphs": pipe.vae.encode_graph_stats(),
         "timing_mode": args.timing,
         "saved_outputs": args.save_outputs,
         "summary_ms": summary(records),

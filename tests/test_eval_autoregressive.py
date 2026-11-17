@@ -451,10 +451,12 @@ def test_rollout_seeds_frames_and_negative_prompt(
         return x[:, :, -t:].expand(1, 3, t, H, W)
 
     seen: list[dict] = []
+    modes: list[bool] = []
     real = policy.sample_window_joint
 
     def spy(**kw: object) -> tuple[torch.Tensor, torch.Tensor]:
         seen.append(kw)
+        modes.append(torch.is_inference_mode_enabled())
         return real(**kw)
 
     monkeypatch.setattr(policy, "sample_window_joint", spy)
@@ -469,6 +471,8 @@ def test_rollout_seeds_frames_and_negative_prompt(
     for _ in range(5):
         roll.step(text, neg)
     assert [kw["seed"] for kw in seen] == [7000, 7001, 7002, 7003, 7004]
+    # The mode of the pipeline sessions (PraxisPolicy.sample_window_joint).
+    assert modes == [True] * 5
     assert [len(kw["cleans"]) for kw in seen] == [0, 1, 2, 3, 3]
     assert all(kw["text_uncond"] is neg and kw["text"] is text for kw in seen)
     assert [c["window_start"] for c in roll.log] == [0, 0, 0, 0, 24]

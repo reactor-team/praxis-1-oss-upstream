@@ -377,6 +377,17 @@ class PraxisPolicy(nn.Module):
           mixture-of-experts layer reads its routed weights once for both
           (``EncoderTower.forward_chunk_causal_pair``). Same bits.
 
+        The pipeline sessions run this call, :meth:`plan_window_joint` and
+        :meth:`finish_window_joint` under ``torch.inference_mode()``
+        (:class:`praxis.pipeline.Session`). A direct call in the same process
+        should run under it too. ``torch.compile`` gives inference tensors and
+        ordinary tensors separate compiled entries. So under
+        ``torch.no_grad()`` the compiled flex attention of the backbone
+        compiles each shape a second time, and the entries count against
+        Dynamo's ``recompile_limit``. Past the limit, Dynamo runs the eager
+        flex attention: a dense kernel that does not fit long sequences and
+        can give other bits. The mode itself does not change the bits.
+
         Returns the video latent of the last chunk ``(1, 192, 6, h, w)`` (None
         with ``skip_last_video``) and its normalized action tokens
         ``(1, 6, A)``, float32. With ``return_window`` the shapes are
@@ -710,6 +721,9 @@ class PraxisPolicy(nn.Module):
 
         ``settings.cfg_batched`` raises ``ValueError``: the plan runs the
         guided and the unguided passes one after the other.
+
+        Run it under ``torch.inference_mode()``, as the pipeline sessions do
+        (see :meth:`sample_window_joint`).
         """
         if settings.layout != "window_joint":
             raise ValueError(f"layout {settings.layout!r} is not 'window_joint'")

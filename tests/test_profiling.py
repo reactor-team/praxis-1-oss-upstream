@@ -242,7 +242,7 @@ def test_benchmark_skips_the_last_video_decoder_as_the_server(
 def test_default_sessions_match_unoptimized_outputs(
     stub_expert: None, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    from praxis import layers
+    from praxis import layers, vae
 
     bench = _script()
     pipe = _pipe(4.0)
@@ -257,6 +257,7 @@ def test_default_sessions_match_unoptimized_outputs(
     # Restore the module defaults after exercising the benchmark opt-out.
     monkeypatch.setattr(layers, "FUSED_ROPE", layers.FUSED_ROPE)
     monkeypatch.setattr(layers, "CACHE_DEVICE_TABLES", layers.CACHE_DEVICE_TABLES)
+    monkeypatch.setattr(vae, "VAE_ENCODE_GRAPH", vae.VAE_ENCODE_GRAPH)
     options = bench.configure_optimizations(pipe, False)
     assert not any(options.values())
     bench.run(pipe, session, 2, 3, 3, save_outputs=reference)

@@ -142,9 +142,13 @@ class VideoRollout:
     def __post_init__(self) -> None:
         self.frames = [np.ascontiguousarray(self.first_frame)]
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def step(self, text: Tensor, negative: Tensor | None) -> np.ndarray:
-        """Sample one chunk and return its new frames."""
+        """Sample one chunk and return its new frames.
+
+        The call runs under ``torch.inference_mode()``, as the pipeline
+        sessions do (:meth:`praxis.model.PraxisPolicy.sample_window_joint`).
+        """
         policy = self.policy
         chunk = len(self.log)
         w, k = history_window(len(self.frames), chunk == 0, self.max_chunks)

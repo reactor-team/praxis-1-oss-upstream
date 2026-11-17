@@ -119,6 +119,12 @@ class PraxisPipeline:
             norm_block_c=vae_norm_block_c,
             decoder_impl="reference",
         )
+        # The serving path replays the encode from CUDA graphs
+        # (VAE_ENCODE_GRAPH) under inference mode; other users stay eager. A
+        # VAE without encode graphs keeps encoding eagerly.
+        enable_encode_graphs = getattr(self.vae, "enable_encode_graphs", None)
+        if enable_encode_graphs is not None:
+            enable_encode_graphs()
         # The fused decoder runs CUDA kernels; other devices keep the reference.
         if decoder_impl == "fused" and self.device.type == "cuda":
             self.vae.enable_fused_decoder()
@@ -384,7 +390,7 @@ class Session:
         if self.memo is not None:
             self.memo.clear()
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def plan(
         self,
         anchor: Tensor,
@@ -427,7 +433,7 @@ class Session:
             else bool(skip_last_video),
         )
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def step(self, obs: dict, executed_rows: int | None = None) -> StepResult:
         """Run one policy call on ``obs`` and return the commands of the chunk.
 
@@ -514,7 +520,7 @@ class Session:
         )
         return video, actions, text
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def decode_video(self, result: StepResult) -> Tensor:
         """Decode the predicted video of one call: one frame per command row.
 

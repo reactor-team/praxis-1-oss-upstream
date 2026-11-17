@@ -19,6 +19,12 @@ The encoder has two paths:
 * ``encode`` (default) is the fused path. It runs channels-last and uses the
   custom Triton kernels in ``praxis.kernels.vae_encoder_triton``. Its output
   is bitwise equal to the encoder of the original serve code on H100 GPUs.
+  With ``VAE_ENCODE_GRAPH`` (default on) the serving path replays one CUDA
+  graph per input shape of ``encode`` (``EncodeGraphs``), with the same bits.
+  Only an autoencoder that opted in (``enable_encode_graphs``, which
+  ``PraxisPipeline`` calls) uses the graphs, and only under
+  ``torch.inference_mode()``; training, evaluation scripts and other callers
+  encode eagerly.
 * ``encode_eager`` is plain PyTorch. It needs no Triton. Its output is not
   bitwise equal to the fused path. The rounding differs.
 
@@ -32,7 +38,12 @@ rather than bitwise reference parity.
 
 from __future__ import annotations
 
+import logging
+import os
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
+from threading import Lock
 
 import torch
 import torch.nn.functional as F
@@ -62,6 +73,27 @@ VAE_HOIST_CASTS = True
 # computes it (K.add_rmsnorm_silu: the same fp16 add, stored once, then the norm
 # of ``_rmsnorm_silu_kernel``). Default on.
 VAE_FUSED_ADD_NORM = True
+
+# True: ``Autoencoder.encode`` replays one CUDA graph per input shape
+# (EncodeGraphs) instead of launching the fused encoder's kernels one by one.
+# The graph holds the same kernels in the same order, so the latents keep their
+# bits; each capture is checked bit for bit against an eager encode of the same
+# frames, and a shape that fails the check (or the capture) stays eager. The
+# encode is stateless: each call starts its causal caches from zero inside the
+# graph, so no cache tensor crosses a call. ``StreamEncode`` stays eager.
+# Scope: the serving path only. A call uses the graphs only on an autoencoder
+# that opted in (``Autoencoder.enable_encode_graphs``, which ``PraxisPipeline``
+# calls) and only under ``torch.inference_mode()``, in which the pipeline's
+# public calls run. Fine-tuning, the evaluation scripts and the serve
+# precompute encode eagerly, so they hold no graph memory pool.
+# Default on; ``PRAXIS_VAE_ENCODE_GRAPH=0`` turns it off. Set before warmup.
+VAE_ENCODE_GRAPH = os.environ.get("PRAXIS_VAE_ENCODE_GRAPH", "1") != "0"
+
+# The number of input shapes that get a graph. More shapes run eagerly. The
+# graphs share one memory pool, so the pool holds about the largest encode.
+VAE_ENCODE_GRAPH_MAX = 8
+
+logger = logging.getLogger(__name__)
 
 
 def _keep(t: Tensor) -> Tensor:
@@ -1023,6 +1055,202 @@ class StreamEncode:
             return to_policy_latent(z)
 
 
+def _same_bits(a: Tensor, b: Tensor) -> bool:
+    """True if ``a`` and ``b`` have one shape, dtype and stride and equal bytes."""
+    return (
+        a.shape == b.shape
+        and a.dtype == b.dtype
+        and a.stride() == b.stride()
+        and torch.equal(
+            a.contiguous().reshape(-1).view(torch.uint8),
+            b.contiguous().reshape(-1).view(torch.uint8),
+        )
+    )
+
+
+class EncodeGraphs:
+    """CUDA graphs of complete ``Autoencoder.encode`` calls (VAE_ENCODE_GRAPH).
+
+    Used by :meth:`Autoencoder.encode` on the serving path only: an
+    autoencoder that opted in (:meth:`Autoencoder.enable_encode_graphs`), in
+    eval mode, under ``torch.inference_mode()`` with gradients off. Other
+    callers (fine-tuning, the evaluation scripts, the serve precompute) never
+    reach it and encode eagerly.
+
+    One graph per key (:meth:`key`: the frame shape and dtype, the autocast
+    and cuDNN modes and the VAE module flags; every call runs under inference
+    mode, so the mode is not part of the key). A graph holds its own
+    static input, a contiguous copy of the frames, and its output. Each call
+    copies the frames in, replays and returns a clone of the output, so a
+    returned latent is never overwritten by a later replay.
+
+    The encode builds its causal caches inside the call, from zero halos. A
+    graph therefore holds no cache tensor of another call, and the cache views
+    of ENCODER_CACHE_VIEWS live in the graph's own memory.
+
+    Capture, on the first call of a key: two eager encodes of the static input
+    (they compile the Triton kernels, settle the cuDNN plans and fill the
+    float16 weight casts of VAE_HOIST_CASTS outside capture), the capture, one
+    replay, then a byte comparison with the last eager encode. A failed
+    capture or comparison marks the key eager for good and logs a warning.
+    Captures happen in the first calls of each shape, which the server and
+    benchmark warmups run.
+
+    All graphs share one memory pool and run on one side stream, in call
+    order, so they never run at the same time. Up to ``max_graphs`` keys get
+    a graph; later keys, calls during another capture, and calls from a
+    second thread while one runs use the eager encode.
+    """
+
+    def __init__(
+        self, fused: FusedEncoder, device: torch.device, max_graphs: int
+    ) -> None:
+        self.fused = fused
+        self.device = device
+        self.max_graphs = int(max_graphs)
+        # key -> (static input, graph, output), or None: the key stays eager.
+        self.variants: dict[tuple, tuple[Tensor, object, Tensor] | None] = {}
+        self.stats = {"captures": 0, "replays": 0, "eager": 0, "rejected": 0}
+        self._lock = Lock()
+        self._warned_full = False
+        self._stream = None
+        self._pool = None
+
+    @staticmethod
+    def key(frames: Tensor) -> tuple:
+        return (
+            tuple(frames.shape),
+            frames.dtype,
+            frames.device,
+            torch.is_autocast_enabled("cuda"),
+            torch.get_autocast_dtype("cuda"),
+            torch.backends.cudnn.enabled,
+            torch.backends.cudnn.deterministic,
+            torch.backends.cudnn.benchmark,
+            torch.backends.cudnn.allow_tf32,
+            torch.are_deterministic_algorithms_enabled(),
+            VAE_HOIST_CASTS,
+            VAE_FUSED_ADD_NORM,
+            ENCODER_CACHE_VIEWS,
+        )
+
+    @property
+    def n_graphs(self) -> int:
+        return sum(v is not None for v in self.variants.values())
+
+    def __call__(self, fn: Callable[[Tensor], Tensor], frames: Tensor) -> Tensor:
+        """Return ``fn(frames)``, from a graph when the key has one."""
+        if frames.device != self.device or not self._lock.acquire(blocking=False):
+            self.stats["eager"] += 1
+            return fn(frames)
+        try:
+            key = self.key(frames)
+            if key not in self.variants:
+                if self.n_graphs >= self.max_graphs:
+                    if not self._warned_full:
+                        logger.warning(
+                            "VAE encode holds %d CUDA graphs; new shapes such as "
+                            "%s encode eagerly",
+                            self.max_graphs,
+                            tuple(frames.shape),
+                        )
+                        self._warned_full = True
+                    self.stats["eager"] += 1
+                    return fn(frames)
+                self.variants[key] = self._build(fn, frames)
+            variant = self.variants[key]
+            if variant is None:
+                self.stats["eager"] += 1
+                return fn(frames)
+            return self._replay(variant, frames)
+        finally:
+            self._lock.release()
+
+    @contextmanager
+    def _side(self) -> Iterator[None]:
+        """Run on the side stream, after the caller's stream's queued work; the
+        caller's stream then waits for the side stream."""
+        if self._stream is None:
+            with torch.cuda.device(self.device):
+                self._stream = torch.cuda.Stream()
+                self._pool = torch.cuda.graph_pool_handle()
+        current = torch.cuda.current_stream(self.device)
+        self._stream.wait_stream(current)
+        try:
+            with torch.cuda.stream(self._stream):
+                yield
+        finally:
+            current.wait_stream(self._stream)
+
+    def _capture(self, fn: Callable[[Tensor], Tensor], static: Tensor):
+        """Capture ``fn(static)``; return the graph and its output.
+
+        The capture checks unsafe CUDA calls of this thread only
+        (``capture_error_mode="thread_local"``): a server thread that
+        allocates pinned memory or creates a session during a lazy capture
+        does not invalidate it. Calls of this thread that a capture forbids
+        still fail it, and the byte check still guards the result.
+        """
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(
+            graph,
+            pool=self._pool,
+            stream=self._stream,
+            capture_error_mode="thread_local",
+        ):
+            output = fn(static)
+        return graph, output
+
+    def _build(self, fn: Callable[[Tensor], Tensor], frames: Tensor):
+        """Capture and check the graph of ``frames``'s key, or return None."""
+        shape = tuple(frames.shape)
+        with self._side():
+            static = torch.empty(frames.shape, dtype=frames.dtype, device=frames.device)
+            static.copy_(frames)
+            for _ in range(2):
+                reference = fn(static)
+            self._sync()
+            try:
+                graph, output = self._capture(fn, static)
+            except Exception as exc:
+                logger.warning(
+                    "VAE encode CUDA graph capture failed for %s; this shape "
+                    "encodes eagerly: %s",
+                    shape,
+                    exc,
+                )
+                self.stats["rejected"] += 1
+                return None
+            graph.replay()
+            same = _same_bits(output, reference)
+        if not same:
+            logger.warning(
+                "VAE encode CUDA graph of %s changed the latent bits; this shape "
+                "encodes eagerly",
+                shape,
+            )
+            self.stats["rejected"] += 1
+            return None
+        self.stats["captures"] += 1
+        logger.info("Captured the VAE encode CUDA graph of %s", shape)
+        return static, graph, output
+
+    def _sync(self) -> None:
+        self._stream.synchronize()
+
+    def _replay(self, variant: tuple[Tensor, object, Tensor], frames: Tensor) -> Tensor:
+        static, graph, output = variant
+        with self._side():
+            static.copy_(frames)
+            graph.replay()
+            result = output.clone()
+        if result.is_cuda:
+            # Allocated on the side stream, used on the caller's stream.
+            result.record_stream(torch.cuda.current_stream(self.device))
+        self.stats["replays"] += 1
+        return result
+
+
 # ---------------------------------------------------------------------------
 # Autoencoder
 # ---------------------------------------------------------------------------
@@ -1030,6 +1258,9 @@ class StreamEncode:
 
 class Autoencoder(nn.Module):
     """The Wan2.2 video autoencoder with the policy pre- and post-processing."""
+
+    # True after enable_encode_graphs: encode may replay CUDA graphs.
+    _encode_graphs_enabled = False
 
     def __init__(
         self,
@@ -1050,6 +1281,7 @@ class Autoencoder(nn.Module):
             "latent_inv_std", 1.0 / torch.tensor(LATENT_STD), persistent=False
         )
         self._fused: FusedEncoder | None = None
+        self._encode_graphs: EncodeGraphs | None = None
         self._decoder_controller = None
         if decoder_impl == "fused":
             self.enable_fused_decoder()
@@ -1061,6 +1293,8 @@ class Autoencoder(nn.Module):
         self.latent_mean = mean.to(device=self.latent_mean.device)
         self.latent_inv_std = inv_std.to(device=self.latent_inv_std.device)
         self._fused = None
+        # The graphs read the old weights and fused encoder: drop them.
+        self._encode_graphs = None
         if self._decoder_controller is not None:
             self._decoder_controller.reset()
         return self
@@ -1157,12 +1391,68 @@ class Autoencoder(nn.Module):
     def encode(self, frames: Tensor) -> Tensor:
         """Encode ``(1, 3, T, H, W)`` frames in ``[0, 255]`` to the policy latent.
 
-        This is the fused path. It needs CUDA and Triton.
+        This is the fused path. It needs CUDA and Triton. On the serving path
+        (:meth:`enable_encode_graphs`, ``torch.inference_mode()``) with
+        VAE_ENCODE_GRAPH it replays a CUDA graph of this encode per input
+        shape (:class:`EncodeGraphs`); the latents keep their bits. Other
+        calls encode eagerly.
         """
+        if self._encode_graph_eligible(frames):
+            fused = self.fused_encoder()
+            graphs = self._encode_graphs
+            if graphs is None or graphs.fused is not fused:
+                graphs = EncodeGraphs(fused, frames.device, VAE_ENCODE_GRAPH_MAX)
+                self._encode_graphs = graphs
+            return graphs(self._encode_fused, frames)
+        return self._encode_fused(frames)
+
+    def _encode_fused(self, frames: Tensor) -> Tensor:
+        """The fused encode of :meth:`encode`, launched eagerly."""
         fused = self.fused_encoder()
         with torch.autocast("cuda", dtype=torch.bfloat16):
             z = fused.encode(self._to_unit(frames))
             return to_policy_latent(z)
+
+    def _encode_graph_eligible(self, frames: Tensor) -> bool:
+        """True if :meth:`encode` may use a CUDA graph for ``frames``.
+
+        It needs VAE_ENCODE_GRAPH, the opt-in of :meth:`enable_encode_graphs`,
+        ``torch.inference_mode()``, a CUDA tensor of rank 5, an eval module, no
+        gradients and no capture or compile around the call. The opt-in and
+        inference mode limit the graphs to the serving path: fine-tuning, the
+        evaluation scripts (some of which run under inference mode) and the
+        serve precompute (under ``no_grad``) stay eager.
+        """
+        return (
+            VAE_ENCODE_GRAPH
+            and self._encode_graphs_enabled
+            and torch.is_inference_mode_enabled()
+            and frames.is_cuda
+            and frames.dim() == 5
+            and not self.training
+            and not torch.is_grad_enabled()
+            and not frames.requires_grad
+            and not torch.compiler.is_compiling()
+            and not torch.cuda.is_current_stream_capturing()
+        )
+
+    def enable_encode_graphs(self) -> Autoencoder:
+        """Let :meth:`encode` replay CUDA graphs (VAE_ENCODE_GRAPH).
+
+        For the serving path: ``PraxisPipeline`` calls it. The graphs then
+        run for the calls under ``torch.inference_mode()`` only, and keep a
+        private memory pool for the life of the module.
+        """
+        self._encode_graphs_enabled = True
+        return self
+
+    def encode_graph_stats(self) -> dict | None:
+        """The counts of the encode graphs (captures, replays, eager calls,
+        rejected shapes, graphs held), or None before the first graphed call."""
+        graphs = self._encode_graphs
+        if graphs is None:
+            return None
+        return {**graphs.stats, "graphs": graphs.n_graphs}
 
     @torch.no_grad()
     def encode_eager(self, frames: Tensor) -> Tensor:

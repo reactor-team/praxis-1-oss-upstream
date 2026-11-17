@@ -47,10 +47,14 @@ def test_pipeline_graph_defaults(
         "from_pretrained",
         lambda *args, **kwargs: SimpleNamespace(config=config),
     )
+    encode_graphs = []
     monkeypatch.setattr(
         module.Autoencoder,
         "from_pretrained",
-        lambda *args, **kwargs: SimpleNamespace(enable_fused_decoder=lambda: None),
+        lambda *args, **kwargs: SimpleNamespace(
+            enable_fused_decoder=lambda: None,
+            enable_encode_graphs=lambda: encode_graphs.append(True),
+        ),
     )
     monkeypatch.setattr(module, "TextEncoder", lambda *args, **kwargs: None)
     enabled = []
@@ -69,6 +73,8 @@ def test_pipeline_graph_defaults(
     pipe = module.PraxisPipeline("checkpoint", "vae", "text", device=device, **options)
     assert enabled == ([pipe] if expected else [])
     assert moe_enabled == ([pipe] if moe_expected else [])
+    # The serving pipeline opts its autoencoder in to the encode graphs.
+    assert encode_graphs == [True]
 
 
 def test_nvfp4_moe_graph_boundaries_and_guards(monkeypatch):
